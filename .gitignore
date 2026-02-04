@@ -151,3 +151,18 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+# Evaluation logs
+eval_logs/
+
+# HuggingFace cache
+hf_cache/
+
+# Kernel metadata
+kernel_meta/
+
+# Logs
+logs/
+
+# Output directories
+outputs/

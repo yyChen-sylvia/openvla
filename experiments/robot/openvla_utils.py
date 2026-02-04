@@ -18,7 +18,18 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 ACTION_DIM = 7
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+# Prefer Ascend NPU if available, then CUDA, otherwise CPU
+if hasattr(torch, "npu") and callable(getattr(torch.npu, "is_available", None)) and torch.npu.is_available():
+    DEVICE = torch.device("npu:0")
+    print(f"[*] Using NPU device: {DEVICE}")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda:0")
+    print(f"[*] Using CUDA device: {DEVICE}")
+else:
+    DEVICE = torch.device("cpu")
+    print("[*] Using CPU device (no NPU/CUDA available)")
+
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 
 # Initialize system prompt for OpenVLA v0.1.
@@ -42,12 +53,13 @@ def get_vla(cfg):
 
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
-        attn_implementation="flash_attention_2",
+        #attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
         low_cpu_mem_usage=True,
-        trust_remote_code=True,
+        trust_remote_code=False,
     )
 
     # Move model to device.
@@ -55,6 +67,12 @@ def get_vla(cfg):
     #       already be set to the right devices and casted to the correct dtype upon loading.
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
         vla = vla.to(DEVICE)
+        # Quick sanity print to confirm model device
+        try:
+            first_param_device = next(vla.parameters()).device
+            print(f"[*] VLA model loaded on device: {first_param_device}")
+        except StopIteration:
+            pass
 
     # Load dataset stats used during finetuning (for action un-normalization).
     dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
@@ -74,7 +92,7 @@ def get_vla(cfg):
 
 def get_processor(cfg):
     """Get VLA model's Hugging Face processor."""
-    processor = AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=False)
     return processor
 
 

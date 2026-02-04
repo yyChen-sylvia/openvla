@@ -359,7 +359,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )
 
         # === Handle Multimodal Forward ===
-        elif (input_ids.shape[0] == pixel_values.shape[0]) or (inputs_embeds.shape[0] == pixel_values.shape[0]):
+        elif (input_ids.shape[0] == pixel_values.shape[0]) or (
+            inputs_embeds is not None and inputs_embeds.shape[0] == pixel_values.shape[0]
+        ):
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
             # Visual Feature Extraction
@@ -510,9 +512,19 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
         if not torch.all(input_ids[:, -1] == 29871):
-            input_ids = torch.cat(
-                (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
-            )
+            # 1) 先在 input_ids 结尾追加 29871 token
+            new_token = torch.unsqueeze(torch.tensor([29871], dtype=input_ids.dtype, device=input_ids.device), dim=0)
+            input_ids = torch.cat((input_ids, new_token), dim=1)
+
+            # 2) 同步扩展 attention_mask，避免下游 LLaMA 构造 causal_mask 时长度不一致
+            attention_mask = kwargs.get("attention_mask", None)
+            if attention_mask is not None:
+                pad = torch.ones(
+                    (attention_mask.shape[0], 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                kwargs["attention_mask"] = torch.cat((attention_mask, pad), dim=1)
 
         # Run VLA inference
         generated_ids = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)

@@ -49,6 +49,12 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
+try:
+    import torch_npu
+    USE_NPU = True
+except ImportError:
+    USE_NPU = False
+
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -100,7 +106,7 @@ class FinetuneConfig:
     lora_rank: int = 32                                             # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
-                                                                    #   => CAUTION: Reduces memory but hurts performance
+    merge_lora_during_training: bool = False                                                                #   => CAUTION: Reduces memory but hurts performance
 
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
@@ -114,11 +120,18 @@ class FinetuneConfig:
 def finetune(cfg: FinetuneConfig) -> None:
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
-    # [Validate] Ensure GPU Available & Set Device / Distributed Context
-    assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
     distributed_state = PartialState()
-    torch.cuda.set_device(device_id := distributed_state.local_process_index)
-    torch.cuda.empty_cache()
+    device_id = distributed_state.local_process_index
+    if USE_NPU:
+        torch.npu.set_device(device_id)
+        torch.npu.empty_cache()
+        device_id = torch.device(f"npu:{device_id}")
+    else:
+        torch.cuda.set_device(device_id)
+        torch.cuda.empty_cache()
+        device_id = torch.device(f"cuda:{device_id}")
+    # Initialize wandb logging
+
 
     # Configure Unique Experiment ID & Log Directory
     exp_id = (
@@ -251,7 +264,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("npu" if USE_NPU else "cuda", dtype=torch.bfloat16):
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
                     attention_mask=batch["attention_mask"].to(device_id),
@@ -323,7 +336,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
                     # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    save_dir = adapter_dir if cfg.use_lora else run_dir
+                    if cfg.use_lora:
+                        # Add step number to adapter directory name
+                        if cfg.save_latest_checkpoint_only:
+                            save_dir = adapter_dir  # Overwrite latest
+                        else:
+                            save_dir = Path(str(adapter_dir) + f"--step_{gradient_step_idx}")  # Save with step number
+                            os.makedirs(save_dir, exist_ok=True)
+                    else:
+                        save_dir = run_dir
 
                     # Save Processor & Weights
                     processor.save_pretrained(run_dir)
@@ -334,21 +355,28 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Merge LoRA weights into model backbone for faster inference
                 #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
+                #   =>> Only merge if merge_lora_during_training is True
+                if cfg.use_lora and cfg.merge_lora_during_training:
+                    # Determine the adapter directory to load from
+                    if cfg.save_latest_checkpoint_only:
+                        load_adapter_dir = adapter_dir
+                    else:
+                        load_adapter_dir = Path(str(adapter_dir) + f"--step_{gradient_step_idx}")
+                    
                     base_vla = AutoModelForVision2Seq.from_pretrained(
                         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
                     )
-                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+                    merged_vla = PeftModel.from_pretrained(base_vla, load_adapter_dir)
                     merged_vla = merged_vla.merge_and_unload()
                     if distributed_state.is_main_process:
                         if cfg.save_latest_checkpoint_only:
                             # Overwrite latest checkpoint
                             merged_vla.save_pretrained(run_dir)
 
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
+                            print(f"Saved Merged Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
                         else:
                             # Prepare to save checkpoint in new directory
-                            checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
+                            checkpoint_dir = Path(str(run_dir) + f"--step_{gradient_step_idx}")
                             os.makedirs(checkpoint_dir, exist_ok=True)
 
                             # Save dataset statistics to new directory
@@ -358,7 +386,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                             processor.save_pretrained(checkpoint_dir)
                             merged_vla.save_pretrained(checkpoint_dir)
 
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
+                            print(f"Saved Merged Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
+                elif cfg.use_lora and not cfg.merge_lora_during_training:
+                    # Only save LoRA adapter weights without merging
+                    if distributed_state.is_main_process:
+                        if cfg.save_latest_checkpoint_only:
+                            print(f"Saved LoRA Adapter Checkpoint for Step {gradient_step_idx} at: {adapter_dir}")
+                        else:
+                            adapter_step_dir = Path(str(adapter_dir) + f"--step_{gradient_step_idx}")
+                            print(f"Saved LoRA Adapter Checkpoint for Step {gradient_step_idx} at: {adapter_step_dir}")
 
                 # Block on Main Process Checkpointing
                 dist.barrier()
